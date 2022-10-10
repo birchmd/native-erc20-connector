@@ -1,5 +1,8 @@
 use crate::{
     aurora_engine_utils::{self, erc20, erc20::ERC20DeployedAt, repo::AuroraEngineRepo},
+    aurora_locker_utils::{self, LockerDeployedAt},
+    nep141_utils,
+    token_factory_utils::{self, TokenFactory},
     wnear_utils::Wnear,
 };
 use aurora_engine::parameters::{CallArgs, FunctionCallArgsV2, SubmitResult};
@@ -38,7 +41,7 @@ async fn test_deploy_erc20() {
         .deploy_evm_contract(constructor.deploy_code("TEST", "AAA"))
         .await
         .unwrap();
-    let erc20 = constructor.abi.deployed_at(address);
+    let erc20 = constructor.deployed_at(address);
     let mint_amount = 7654321.into();
     let recipient = Address::decode("000000000000000000000000000000000000000a").unwrap();
     let result = engine
@@ -145,11 +148,143 @@ async fn test_deploy_token_factory() {
     // In reality we would deploy the locker contract and get its address,
     // but that is not needed for this test. We can choose any address we like.
     let locker_address = Address::decode("000000000000000000000000000000000000000a").unwrap();
-    let _factory = crate::token_factory_utils::TokenFactory::deploy(
-        &worker,
-        locker_address,
-        engine.inner.id(),
+    let _factory = TokenFactory::deploy(&worker, locker_address, engine.inner.id())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_native_token_connector() {
+    let wnear_mint_amount = 50_000_000_000_000_000_000_000_000_u128;
+    let token_mint_amount = 0x_1000_0000_0000_0000_u128;
+    let token_deposit_amount = 0x_aaaa_bbbb_cccc_u128;
+    let context = NativeTokenConnectorTestContext::new().await.unwrap();
+    let user = context.worker.dev_create_account().await.unwrap();
+    let user_address = aurora_engine_sdk::types::near_account_to_evm_address(user.id().as_bytes());
+
+    // Mint ERC-20 tokens for user in EVM
+    let mint_result = context
+        .engine
+        .call_evm_contract(
+            context.erc20.address,
+            context.erc20.mint(user_address, token_mint_amount.into()),
+            Wei::zero(),
+        )
+        .await
+        .unwrap();
+    aurora_engine_utils::unwrap_success(mint_result.status).unwrap();
+
+    // Mint NEAR for user in EVM
+    context
+        .engine
+        .mint_wnear(&context.wnear, user_address, wnear_mint_amount)
+        .await
+        .unwrap();
+
+    // Approve locker to take tokens from user
+    let approve_result = context
+        .engine
+        .call_evm_contract_with(
+            &user,
+            context.erc20.address,
+            context
+                .erc20
+                .approve(context.locker.address, token_mint_amount.into()),
+            Wei::zero(),
+        )
+        .await
+        .unwrap();
+    aurora_engine_utils::unwrap_success(approve_result.status).unwrap();
+
+    // Approve locker to take NEAR from user
+    let approve_result = context
+        .engine
+        .call_evm_contract_with(
+            &user,
+            context.wnear.aurora_token.address,
+            context
+                .wnear
+                .aurora_token
+                .approve(context.locker.address, wnear_mint_amount.into()),
+            Wei::zero(),
+        )
+        .await
+        .unwrap();
+    aurora_engine_utils::unwrap_success(approve_result.status).unwrap();
+
+    // Deposit tokens into locker
+    let deposit_result = context
+        .engine
+        .call_evm_contract_with(
+            &user,
+            context.locker.address,
+            context
+                .locker
+                .deposit(context.erc20.address, user.id(), token_deposit_amount),
+            Wei::zero(),
+        )
+        .await
+        .unwrap();
+    // TODO: why does this fail? Something goes wrong when Locker calls XCC precompile.
+    aurora_engine_utils::unwrap_success(deposit_result.status).unwrap();
+
+    // Verify the balance exists on NEAR now
+    let token_account = format!(
+        "{}.{}",
+        context.locker.address.encode(),
+        context.factory.inner.id()
     )
-    .await
+    .parse()
     .unwrap();
+    let balance = nep141_utils::ft_balance_of(&user, &token_account, user.id())
+        .await
+        .unwrap();
+    assert_eq!(balance, token_deposit_amount);
+
+    // TODO:
+    // 1. Withdraw token from NEAR
+    // 2. Verify it is returned to the EVM
+}
+
+struct NativeTokenConnectorTestContext {
+    pub worker: workspaces::Worker<workspaces::network::Sandbox>,
+    pub engine: aurora_engine_utils::AuroraEngine,
+    pub wnear: Wnear,
+    pub locker: aurora_locker_utils::AuroraLocker,
+    pub factory: TokenFactory,
+    pub erc20: erc20::ERC20,
+}
+
+impl NativeTokenConnectorTestContext {
+    pub async fn new() -> anyhow::Result<Self> {
+        let worker = workspaces::sandbox().await?;
+        let engine = aurora_engine_utils::deploy_latest(&worker).await?;
+        let wnear = Wnear::deploy(&worker, &engine).await?;
+        let locker = {
+            let constructor = aurora_locker_utils::create_locker_constructor(&engine).await?;
+            let address = engine
+                .deploy_evm_contract(constructor.deploy_code(
+                    &token_factory_utils::FACTORY_ACCOUNT_ID.parse()?,
+                    wnear.aurora_token.address,
+                ))
+                .await?;
+            constructor.deployed_at(address)
+        };
+        let factory = TokenFactory::deploy(&worker, locker.address, engine.inner.id()).await?;
+        let erc20 = {
+            let constructor = erc20::Constructor::load().await?;
+            let address = engine
+                .deploy_evm_contract(constructor.deploy_code("TEST", "AAA"))
+                .await?;
+            constructor.deployed_at(address)
+        };
+        Ok(Self {
+            worker,
+            engine,
+            wnear,
+            locker,
+            factory,
+            erc20,
+        })
+    }
 }

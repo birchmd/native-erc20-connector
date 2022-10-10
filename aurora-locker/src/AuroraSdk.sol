@@ -42,13 +42,15 @@ library AuroraSdk {
 
     /// Create an instance of NEAR object. Requires the address at which
     /// wNEAR ERC20 token contract is deployed.
-    function initNear(IERC20 wNEAR) public pure returns (NEAR memory) {
-        return NEAR(false, wNEAR);
+    function initNear(IERC20 wNEAR) public returns (NEAR memory) {
+        NEAR memory near = NEAR(false, wNEAR);
+        near.wNEAR.approve(XCC_PRECOMPILE, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+        return near;
     }
 
     /// Default configuration for mainnet.
-    function mainnet() public pure returns (NEAR memory) {
-        return NEAR(false, IERC20(wNEAR_MAINNET));
+    function mainnet() public returns (NEAR memory) {
+        return initNear(IERC20(wNEAR_MAINNET));
     }
 
     /// Compute NEAR represtentative account for the given Aurora address.
